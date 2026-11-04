@@ -2,12 +2,18 @@ name: EMA200 Cross Alert
 
 on:
   schedule:
-    # 16:15 IST (10:45 UTC), Mon-Fri, after the NSE close. Backup to the cron-job.org trigger.
-    - cron: "45 10 * * 1-5"
+    # Every 15 min during NSE hours, Mon-Fri. Cron is UTC (IST = UTC+5:30).
+    - cron: "45 3 * * 1-5"       # 09:15 IST
+    - cron: "*/15 4-9 * * 1-5"   # 09:30 - 15:15 IST
+    - cron: "0 10 * * 1-5"       # 15:30 IST
   workflow_dispatch:
     inputs:
       send_test:
         description: "Send a test message to Telegram"
+        type: boolean
+        default: false
+      force:
+        description: "Run even outside market hours (for testing)"
         type: boolean
         default: false
 
@@ -21,7 +27,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - name: Telegram test message
         if: ${{ inputs.send_test }}
@@ -46,6 +52,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_RUN: ${{ inputs.force }}
         run: python ema200_alert.py
 
       - name: Save state
