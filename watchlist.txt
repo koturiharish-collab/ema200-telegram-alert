@@ -1,0 +1,11 @@
+# One NSE symbol per line (no .NS needed). Replace with your own list.
+RELIANCE
+TCS
+HDFCBANK
+INFY
+ICICIBANK
+TECHM
+HEROMOTOCO
+SBIN
+ITC
+LT
