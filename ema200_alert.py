@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
-"""200 EMA cross alert (daily) for NSE stocks -> Telegram.
+"""LIVE 200 EMA cross alert for NSE stocks -> Telegram.
 
-Alerts when a stock's daily CLOSE crosses the 200-day EMA:
-  🟢 closes ABOVE the 200 EMA (previous close was at/below it)
-  🔴 closes BELOW the 200 EMA (previous close was at/above it)
+Runs every 15 minutes during Indian market hours (Mon-Fri, 09:15-15:30 IST).
+For every NSE stock it compares the live price with the daily 200 EMA:
+  🟢 price moves ABOVE the 200 EMA  -> alert
+  🔴 price moves BELOW the 200 EMA  -> alert
+and alerts again on every later flip during the day.
 
-Files:  watchlist.txt  (one NSE symbol per line, e.g. RELIANCE; '#' = comment)
-        ema200_state.json (alerts already sent, so nothing is sent twice)
-Env:    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+How it stays fast:
+  * First run of each trading day: downloads ~2 years of history for all stocks and
+    stores each stock's 200 EMA (as of yesterday's close) in ema200_state.json.
+  * Every later run: downloads only the last few days (live price) and updates the
+    EMA with today's live price.
+
+Files:  watchlist.txt  ("ALL" = every NSE equity, or your own symbols one per line)
+        ema200_state.json (EMA values and which side of the EMA each stock is on)
+Env:    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, FORCE_RUN (true = ignore market hours)
 Completely independent of any other bot or repo.
 """
+import csv
+import io
 import json
 import os
 import sys
@@ -22,18 +32,63 @@ import yfinance as yf
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+FORCE = os.environ.get("FORCE_RUN", "").strip().lower() == "true"
 WATCHLIST_FILE = "watchlist.txt"
 STATE_FILE = "ema200_state.json"
 
 EMA_PERIOD = 200
-MIN_BARS = EMA_PERIOD + 5      # need enough history for a stable EMA
-HISTORY_PERIOD = "3y"          # ~750 trading days
-BATCH_SIZE = 40
+ALPHA = 2.0 / (EMA_PERIOD + 1)
+MIN_BARS = EMA_PERIOD + 5          # need enough history for a stable EMA
+HISTORY_PERIOD = "2y"              # ~500 trading days
+LIVE_PERIOD = "5d"
+BATCH_SIZE = 100
+CHUNK_SIZE = 40                    # stocks per Telegram message
+BAND = 0.001                       # 0.1%: price must be this far past the EMA to count as a cross
+MIN_PRICE = 20.0                   # skip penny stocks (0 = off)
+MIN_AVG_VOLUME = 50000             # skip thinly traded stocks, 20-day avg volume (0 = off)
+REF_SYMBOLS = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"]  # used to read the trading calendar
+NSE_EQUITY_LIST = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+
 IST = timezone(timedelta(hours=5, minutes=30))
-MARKET_CLOSE_IST = (15, 45)    # before this, today's bar is incomplete and is ignored
+MARKET_OPEN = (9, 15)
+MARKET_END = (15, 45)              # a little after the 15:30 close, to allow for delayed runs
+
+
+# ----------------------------------------------------------------------------- symbols
+def fetch_all_nse_symbols():
+    """Download the official list of all NSE-listed equities (series EQ)."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/csv,*/*",
+        "Referer": "https://www.nseindia.com/",
+    }
+    last_err = None
+    for attempt in range(1, 5):
+        try:
+            resp = requests.get(NSE_EQUITY_LIST, headers=headers, timeout=40)
+            resp.raise_for_status()
+            rows = csv.DictReader(io.StringIO(resp.text))
+            symbols = []
+            for row in rows:
+                row = {(k or "").strip().upper(): (v or "").strip() for k, v in row.items()}
+                if row.get("SERIES") == "EQ" and row.get("SYMBOL"):
+                    symbols.append(row["SYMBOL"].upper())
+            if len(symbols) < 500:
+                raise ValueError(f"only {len(symbols)} symbols in NSE list")
+            print(f"Downloaded NSE equity list: {len(symbols)} symbols")
+            return list(dict.fromkeys(symbols))
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            print(f"NSE list attempt {attempt} failed: {exc}")
+            time.sleep(5 * attempt)
+    raise RuntimeError(f"Could not download the NSE equity list: {last_err}")
 
 
 def load_watchlist():
+    """watchlist.txt containing only the word ALL = every NSE equity (auto-downloaded)."""
     symbols = []
     with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
         for line in f:
@@ -43,102 +98,112 @@ def load_watchlist():
             if s.endswith(".NS"):
                 s = s[:-3]
             symbols.append(s)
-    return list(dict.fromkeys(symbols))  # de-duplicate, keep order
+    if symbols == ["ALL"]:
+        return fetch_all_nse_symbols()
+    return list(dict.fromkeys(symbols))
 
 
+# ----------------------------------------------------------------------------- state
 def load_state():
-    """Return dict of sent keys, or None if the state file doesn't exist yet."""
     if not os.path.exists(STATE_FILE):
-        return None
+        return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return set(map(str, data)) if isinstance(data, list) else set()
+        return data if isinstance(data, dict) else {}  # old list-format file -> start fresh
     except Exception as exc:  # noqa: BLE001
         print(f"Could not read {STATE_FILE}: {exc}")
-        return set()
+        return {}
 
 
-def save_state(seen):
-    # keep the file small: only the newest 5000 keys (keys start with the date)
-    keep = sorted(seen)[-5000:]
+def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(keep, f, indent=1)
+        json.dump(state, f, sort_keys=True, separators=(",", ":"))
 
 
-def drop_incomplete_bar(close):
-    """If today's candle is still forming (market open), ignore it."""
-    now = datetime.now(IST)
-    if close.empty:
-        return close
-    last_date = close.index[-1].date()
-    before_close = (now.hour, now.minute) < MARKET_CLOSE_IST
-    if last_date == now.date() and before_close:
-        return close.iloc[:-1]
-    return close
-
-
-def detect_cross(close):
-    """Return (direction, date, last_close, last_ema) or None.
-
-    direction is 'ABOVE' or 'BELOW' when the latest completed daily close
-    crossed the EMA relative to the previous close.
-    """
-    close = close.dropna()
-    if len(close) < MIN_BARS:
-        return None
-    ema = close.ewm(span=EMA_PERIOD, adjust=False).mean()
-    prev_c, last_c = float(close.iloc[-2]), float(close.iloc[-1])
-    prev_e, last_e = float(ema.iloc[-2]), float(ema.iloc[-1])
-    if prev_c <= prev_e and last_c > last_e:
-        direction = "ABOVE"
-    elif prev_c >= prev_e and last_c < last_e:
-        direction = "BELOW"
-    else:
-        return None
-    return direction, close.index[-1].date(), last_c, last_e
-
-
-def fetch_closes(symbols):
-    """Download daily closes for all symbols in batches. Returns {symbol: Series}."""
+# ----------------------------------------------------------------------------- prices
+def download(symbols, period):
+    """Download daily Open/High/Low/Close/Volume in batches. Returns {symbol: DataFrame(Close, Volume)}."""
     out = {}
+    nbatches = max(1, (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE)
     for i in range(0, len(symbols), BATCH_SIZE):
         batch = symbols[i : i + BATCH_SIZE]
         tickers = [f"{s}.NS" for s in batch]
+        n = i // BATCH_SIZE + 1
         data = None
         for attempt in range(1, 4):
             try:
                 data = yf.download(
                     tickers,
-                    period=HISTORY_PERIOD,
+                    period=period,
                     interval="1d",
                     group_by="ticker",
-                    auto_adjust=True,
+                    auto_adjust=False,
                     progress=False,
                     threads=True,
                 )
                 if data is not None and not data.empty:
                     break
             except Exception as exc:  # noqa: BLE001
-                print(f"Batch {i // BATCH_SIZE + 1} attempt {attempt} failed: {exc}")
-            time.sleep(5 * attempt)
+                print(f"Batch {n}/{nbatches} ({period}) attempt {attempt} failed: {exc}")
+            time.sleep(3 * attempt)
         if data is None or data.empty:
-            print(f"Batch {i // BATCH_SIZE + 1}: no data")
+            print(f"Batch {n}/{nbatches} ({period}): no data")
             continue
         for sym, tk in zip(batch, tickers):
             try:
                 if isinstance(data.columns, pd.MultiIndex):
-                    series = data[tk]["Close"]
+                    df = data[tk][["Close", "Volume"]]
                 else:  # single ticker in the batch
-                    series = data["Close"]
-                series = series.dropna()
-                if not series.empty:
-                    out[sym] = series
+                    df = data[["Close", "Volume"]]
+                df = df.dropna(subset=["Close"])
+                if not df.empty:
+                    out[sym] = df
             except KeyError:
                 continue
+        time.sleep(1)
     return out
 
 
+def is_liquid(done):
+    """done = completed daily bars. Skip penny / thinly traded stocks (they flip constantly)."""
+    if MIN_PRICE and float(done["Close"].iloc[-1]) < MIN_PRICE:
+        return False
+    if MIN_AVG_VOLUME:
+        avg_vol = float(done["Volume"].tail(20).mean())
+        if not avg_vol >= MIN_AVG_VOLUME:
+            return False
+    return True
+
+
+def rebuild_state(symbols, today_ref, last_done, old_state):
+    """Once per trading day: compute each stock's EMA200 as of the last completed close."""
+    print(f"Rebuilding EMA200 for {len(symbols)} symbols (as of {last_done})")
+    hist = download(symbols, HISTORY_PERIOD)
+    old_side = old_state.get("side", {}) if isinstance(old_state, dict) else {}
+    ema_map, side_map = {}, {}
+    short = 0
+    for sym, df in hist.items():
+        mask = [d < today_ref for d in df.index.date]
+        done = df.loc[mask]
+        if len(done) < MIN_BARS:
+            short += 1
+            continue
+        if not is_liquid(done):
+            continue
+        close = done["Close"]
+        ema = close.ewm(span=EMA_PERIOD, adjust=False).mean()
+        ema_map[sym] = round(float(ema.iloc[-1]), 4)
+        computed = "ABOVE" if float(close.iloc[-1]) > float(ema.iloc[-1]) else "BELOW"
+        side_map[sym] = old_side.get(sym, computed)
+    print(
+        f"History for {len(hist)}/{len(symbols)} symbols; tracking {len(ema_map)} liquid stocks "
+        f"(skipped {short} with too little history)"
+    )
+    return {"asof": last_done.isoformat(), "fails": 0, "ema": ema_map, "side": side_map}
+
+
+# ----------------------------------------------------------------------------- telegram
 def send_telegram(text):
     if not TOKEN or not CHAT_ID:
         print("Telegram secrets missing, would have sent:\n" + text)
@@ -158,83 +223,128 @@ def send_telegram(text):
         return False
 
 
-def build_message(direction, cross_date, items):
+def build_message(direction, when, items):
     if direction == "ABOVE":
-        head = f"🟢 200 EMA CROSS UP (Daily) — {len(items)} stock(s)"
-        note = "Closed ABOVE the 200 EMA"
+        head = f"🟢 200 EMA CROSSED UP · {when} IST · {len(items)} stock(s)"
     else:
-        head = f"🔴 200 EMA CROSS DOWN (Daily) — {len(items)} stock(s)"
-        note = "Closed BELOW the 200 EMA"
-    lines = [head, f"📅 {cross_date.strftime('%d-%b-%Y')} · {note}", ""]
-    for sym, close, ema in items:
-        gap = (close / ema - 1) * 100
-        lines.append(f"📊 {sym}: ₹{close:,.2f} (EMA200 ₹{ema:,.2f}, {gap:+.2f}%)")
+        head = f"🔴 200 EMA CROSSED DOWN · {when} IST · {len(items)} stock(s)"
+    lines = [head, "(daily 200 EMA vs live price)", ""]
+    for sym, price, ema in items:
+        gap = (price / ema - 1) * 100
+        lines.append(f"📊 {sym}: ₹{price:,.2f} (EMA200 ₹{ema:,.2f}, {gap:+.2f}%)")
     return "\n".join(lines)
 
 
+# ----------------------------------------------------------------------------- main
 def main():
+    now = datetime.now(IST)
+    if not FORCE:
+        if now.weekday() >= 5:
+            print("Weekend: market closed.")
+            return 0
+        hm = (now.hour, now.minute)
+        if hm < MARKET_OPEN or hm > MARKET_END:
+            print(f"{now:%H:%M} IST is outside market hours (09:15-15:30): nothing to do.")
+            return 0
+
     symbols = load_watchlist()
     if not symbols:
         print("watchlist.txt is empty.")
         return 1
     print(f"Watchlist: {len(symbols)} symbols")
 
-    if datetime.now(IST).weekday() >= 5:
-        print("Weekend: markets closed, nothing to do.")
-        return 0
+    state = load_state()
 
-    closes = fetch_closes(symbols)
-    print(f"Got price data for {len(closes)}/{len(symbols)} symbols")
-    if len(closes) < max(1, len(symbols) // 2):
-        print("Too much data missing: treating this run as failed.")
-        return 1
+    # Trading calendar from a few big stocks: is the market open today, and what was the last completed day?
+    cal = download(REF_SYMBOLS, LIVE_PERIOD)
+    dates = sorted({d for df in cal.values() for d in df.index.date})
+    if not dates:
+        print("Could not read any price data (Yahoo Finance down?).")
+        return _record_failure(state)
+    if FORCE:
+        today_ref = dates[-1]
+        print(f"FORCE_RUN: treating {today_ref} as today.")
+    else:
+        today_ref = now.date()
+        if dates[-1] != today_ref:
+            print(f"No price bar for {today_ref}: market holiday or not open yet. Nothing to do.")
+            return 0
+    done_dates = [d for d in dates if d < today_ref]
+    if not done_dates:
+        print("Could not find the previous trading day.")
+        return _record_failure(state)
+    last_done = done_dates[-1]
 
-    seen = load_state()
-    first_run = seen is None
-    if first_run:
-        seen = set()
-        print("No state file yet: recording current crosses without sending.")
+    # Phase 1: once per trading day, rebuild the EMA table.
+    if state.get("asof") != last_done.isoformat() or not state.get("ema"):
+        state = rebuild_state(symbols, today_ref, last_done, state)
+        if not state["ema"]:
+            print("EMA rebuild produced no stocks.")
+            return 1
+        save_state(state)
 
-    groups = {"ABOVE": {}, "BELOW": {}}  # direction -> {date: [(sym, close, ema)]}
-    skipped = []
-    for sym, series in closes.items():
-        series = drop_incomplete_bar(series)
-        res = detect_cross(series)
-        if len(series.dropna()) < MIN_BARS:
-            skipped.append(sym)
-        if not res:
+    # Phase 2: live price check.
+    tracked = list(state["ema"].keys())
+    live = download(tracked, LIVE_PERIOD)
+    got = 0
+    changes = {"ABOVE": [], "BELOW": []}
+    old_sides = {}
+    for sym, df in live.items():
+        if df.index[-1].date() != today_ref:
+            continue  # no trade yet today (or halted)
+        got += 1
+        price = float(df["Close"].iloc[-1])
+        ema_live = ALPHA * price + (1 - ALPHA) * state["ema"][sym]
+        prev_side = state["side"].get(sym)
+        if price > ema_live * (1 + BAND):
+            new_side = "ABOVE"
+        elif price < ema_live * (1 - BAND):
+            new_side = "BELOW"
+        else:
+            new_side = prev_side or ("ABOVE" if price > ema_live else "BELOW")
+        if prev_side is None:
+            state["side"][sym] = new_side
             continue
-        direction, cdate, last_c, last_e = res
-        key = f"{cdate.isoformat()}|{sym}|{direction}"
-        if key in seen:
-            continue
-        seen.add(key)
-        if not first_run:
-            groups[direction].setdefault(cdate, []).append((sym, last_c, last_e))
+        if new_side != prev_side:
+            old_sides[sym] = prev_side
+            state["side"][sym] = new_side
+            changes[new_side].append((sym, price, ema_live))
+    print(f"Live prices for {got}/{len(tracked)} tracked stocks")
 
-    if skipped:
-        print(f"Not enough history for EMA200 (skipped): {', '.join(sorted(skipped))}")
+    if got < max(1, len(tracked) // 2):
+        print("Too much live data missing.")
+        return _record_failure(state)
+    state["fails"] = 0
 
-    failed = 0
-    sent = 0
+    when = now.strftime("%H:%M")
+    sent = failed = 0
     for direction in ("ABOVE", "BELOW"):
-        for cdate, items in sorted(groups[direction].items()):
-            items.sort()
-            # Telegram limit is ~4096 chars: send in chunks of 30 stocks
-            for j in range(0, len(items), 30):
-                chunk = items[j : j + 30]
-                if send_telegram(build_message(direction, cdate, chunk)):
-                    sent += 1
-                else:
-                    failed += 1
-                    # un-mark so it is retried on the next run
-                    for sym, _, _ in chunk:
-                        seen.discard(f"{cdate.isoformat()}|{sym}|{direction}")
-                time.sleep(1.2)
+        items = sorted(changes[direction])
+        for j in range(0, len(items), CHUNK_SIZE):
+            chunk = items[j : j + CHUNK_SIZE]
+            if send_telegram(build_message(direction, when, chunk)):
+                sent += 1
+            else:
+                failed += 1
+                for sym, _, _ in chunk:  # retry on the next run
+                    state["side"][sym] = old_sides[sym]
+            time.sleep(1.2)
 
-    save_state(seen)
-    print(f"Done. Messages sent: {sent}, failed: {failed}, state entries: {len(seen)}")
+    save_state(state)
+    crossed = len(changes["ABOVE"]) + len(changes["BELOW"])
+    print(f"Done. Crosses: {crossed} (up {len(changes['ABOVE'])}, down {len(changes['BELOW'])}); "
+          f"messages sent: {sent}, failed: {failed}")
     return 1 if failed else 0
+
+
+def _record_failure(state):
+    """Only raise the alarm (exit 1) after 2 failed runs in a row, so one Yahoo hiccup stays quiet."""
+    fails = int(state.get("fails", 0)) + 1
+    state["fails"] = fails
+    if state.get("ema"):
+        save_state(state)
+    print(f"Failure count: {fails}")
+    return 1 if fails >= 2 else 0
 
 
 if __name__ == "__main__":
