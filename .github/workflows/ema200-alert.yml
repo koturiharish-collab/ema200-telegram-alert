@@ -3,13 +3,12 @@ name: EMA200 Cross Alert
 on:
   workflow_dispatch:
 
-# Queue runs instead of letting them overlap (overlap caused the merge conflict)
 concurrency:
   group: ema200-alert
   cancel-in-progress: false
 
 permissions:
-  contents: write   # needed so the job can push ema200_state.json
+  contents: write
 
 jobs:
   scan:
@@ -31,27 +30,32 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Scan 200 EMA crosses
-        # TODO: replace with YOUR existing command and env/secrets
-        run: python ema200_scan.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # Auto-detect the script: the one that reads/writes ema200_state.json
+          SCRIPT=$(grep -l "ema200_state" *.py | head -n 1)
+          if [ -z "$SCRIPT" ]; then
+            echo "No script referencing ema200_state found. Files here:"
+            ls -la
+            exit 1
+          fi
+          echo "Running $SCRIPT"
+          python "$SCRIPT"
 
       - name: Save state
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add ema200_state.json
-          # Nothing changed -> nothing to save
           git diff --cached --quiet && exit 0
           git commit -m "update ema200 state"
-          # State file is overwritten each run, so this run's version wins on conflict
           git pull --rebase -X theirs origin main
           git push origin HEAD:main
 
       - name: Telegram failure notice
         if: failure()
-        # TODO: replace with YOUR existing failure-notice step if different
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
